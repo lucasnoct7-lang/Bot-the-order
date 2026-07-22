@@ -15,6 +15,15 @@ Bot de Discord em Python para administrar o clã, registrar atividades e organiz
 
 ## Sistema de torneio
 
+Tambem e possivel criar o torneio a partir de uma enquete nativa do Discord:
+
+1. Crie uma enquete com uma opcao para quem vai participar e outra para quem nao vai.
+2. Copie o link da mensagem da enquete.
+3. Use /criar_torneio, escolha o modo e cole o link no campo enquete.
+4. O bot mostra um menu com as opcoes da enquete; selecione apenas a opcao de quem vai participar.
+
+O campo participantes continua disponivel para cadastrar os membros manualmente.
+
 Use `/criar_torneio` com uma lista de membros. Apenas quem tem a permissão **Gerenciar Servidor** pode criar ou encerrar torneios.
 
 - **Solo:** uma pessoa por equipe

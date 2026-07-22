@@ -35,6 +35,10 @@ from views import (
 
 logger = logging.getLogger(__name__)
 
+POLL_MESSAGE_URL = re.compile(
+    r"https?://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)/?"
+)
+
 
 @dataclass(slots=True)
 class InviteState:
@@ -439,6 +443,79 @@ def ticket_status_label(status: str) -> str:
     }.get(status, status)
 
 
+class PollTournamentSelectionView(discord.ui.View):
+    def __init__(
+        self,
+        cog: "ClanCog",
+        *,
+        owner_id: int,
+        poll_message: discord.Message,
+        mode: str,
+        team_size: int,
+        title: str | None,
+    ) -> None:
+        super().__init__(timeout=180)
+        poll = poll_message.poll
+        if poll is None:
+            raise ValueError("A mensagem nao possui uma enquete.")
+
+        self.cog = cog
+        self.owner_id = owner_id
+        self.poll_message = poll_message
+        self.mode = mode
+        self.team_size = team_size
+        self.title = title
+        self.answer_select = discord.ui.Select(
+            placeholder="Escolha a opcao da enquete",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=trim_text(answer.text, 100),
+                    value=str(answer.id),
+                    description=trim_text(f"{answer.vote_count} voto(s)", 100),
+                )
+                for answer in poll.answers
+            ],
+        )
+        self.answer_select.callback = self.select_answer
+        self.add_item(self.answer_select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "Somente quem iniciou a criacao do torneio pode escolher a opcao.",
+            ephemeral=True,
+        )
+        return False
+
+    async def select_answer(self, interaction: discord.Interaction) -> None:
+        poll = self.poll_message.poll
+        answer_id = int(self.answer_select.values[0])
+        answer = poll.get_answer(answer_id) if poll else None
+        if answer is None:
+            await interaction.response.send_message(
+                "Nao encontrei essa opcao na enquete. Tente iniciar o comando novamente.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        created = await self.cog.create_tournament_from_poll_answer(
+            interaction,
+            mode=self.mode,
+            team_size=self.team_size,
+            title=self.title,
+            answer=answer,
+        )
+        if created:
+            self.answer_select.disabled = True
+            if interaction.message is not None:
+                await interaction.message.edit(view=self)
+            self.stop()
+
+
 class ClanCog(commands.Cog):
     def __init__(self, bot: "ClanBot") -> None:
         self.bot = bot
@@ -620,10 +697,129 @@ class ClanCog(commands.Cog):
             )
         return embed
 
+    async def fetch_poll_message(
+        self,
+        guild: discord.Guild,
+        raw_link: str,
+    ) -> tuple[discord.Message | None, str | None]:
+        match = POLL_MESSAGE_URL.fullmatch(raw_link.strip())
+        if match is None:
+            return None, "Cole o link completo da mensagem que possui a enquete."
+
+        guild_id, channel_id, message_id = (int(value) for value in match.groups())
+        if guild_id != guild.id:
+            return None, "A enquete precisa estar no mesmo servidor do torneio."
+
+        channel = guild.get_channel_or_thread(channel_id)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return None, "Nao encontrei o canal da enquete."
+
+        try:
+            message = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            return None, "Nao encontrei essa mensagem de enquete."
+        except discord.Forbidden:
+            return None, "Preciso das permissoes Ver canal e Ler historico de mensagens na enquete."
+        except discord.HTTPException:
+            return None, "Nao consegui ler a enquete agora. Tente novamente."
+
+        if message.poll is None:
+            return None, "A mensagem informada nao possui uma enquete do Discord."
+        if not message.poll.answers:
+            return None, "Essa enquete nao possui opcoes para selecionar."
+        return message, None
+
+    async def create_tournament_from_poll_answer(
+        self,
+        interaction: discord.Interaction,
+        *,
+        mode: str,
+        team_size: int,
+        title: str | None,
+        answer: discord.PollAnswer,
+    ) -> bool:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send("Esse comando so funciona dentro de um servidor.", ephemeral=True)
+            return False
+        if self.bot.database.get_active_tournament(guild.id) is not None:
+            await interaction.followup.send(
+                "Ja existe um torneio aberto. Encerre-o antes de criar outro.",
+                ephemeral=True,
+            )
+            return False
+
+        participants: list[TournamentParticipant] = []
+        seen_member_ids: set[int] = set()
+        try:
+            async for voter in answer.voters():
+                member = voter if isinstance(voter, discord.Member) else guild.get_member(voter.id)
+                if member is None or member.bot or member.id in seen_member_ids:
+                    continue
+                seen_member_ids.add(member.id)
+                tier_label, tier_weight = self.get_tournament_tier(member)
+                participants.append(
+                    TournamentParticipant(
+                        user_id=member.id,
+                        user_tag=str(member),
+                        display_name=member.display_name,
+                        mention=member.mention,
+                        tier_label=tier_label,
+                        tier_weight=tier_weight,
+                    )
+                )
+        except discord.HTTPException:
+            await interaction.followup.send(
+                "Nao consegui carregar os votos dessa enquete. Tente novamente.",
+                ephemeral=True,
+            )
+            return False
+
+        if len(participants) < team_size * 2:
+            await interaction.followup.send(
+                "Essa opcao nao possui votos suficientes para formar duas equipes completas.",
+                ephemeral=True,
+            )
+            return False
+        if len(participants) > 32:
+            await interaction.followup.send(
+                "Essa opcao possui mais de 32 participantes. Reduza a lista antes de sortear.",
+                ephemeral=True,
+            )
+            return False
+        if len(participants) % team_size != 0:
+            await interaction.followup.send(
+                f"{len(participants)} votos nao formam equipes completas de {team_size}.",
+                ephemeral=True,
+            )
+            return False
+
+        teams = self.build_balanced_teams(participants, team_size)
+        tournament_id = self.bot.database.create_tournament(
+            guild_id=guild.id,
+            title=(title or f"Torneio {mode.title()}").strip()[:100],
+            mode=mode,
+            team_size=team_size,
+            created_by_id=interaction.user.id,
+            created_by_tag=str(interaction.user),
+            teams=teams,
+        )
+        tournament = self.bot.database.get_tournament(guild.id, tournament_id)
+        if tournament is None:
+            await interaction.followup.send("Nao consegui salvar o torneio.", ephemeral=True)
+            return False
+
+        await interaction.followup.send(
+            f"Participantes puxados da opcao: {answer.text}",
+            embed=self.build_tournament_embed(tournament, teams),
+        )
+        return True
+
     @app_commands.command(name="criar_torneio", description="Cria um torneio e sorteia equipes equilibradas.")
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(
         modo="Solo cria 1 jogador por equipe; Duo cria 2; Time usa o tamanho informado.",
+        enquete="Cole o link da enquete para puxar os votantes de uma opcao.",
         participantes="Mencione ou liste os membros separados por vírgula, ponto e vírgula ou quebra de linha.",
         jogadores_por_equipe="Obrigatório apenas no modo Time.",
         titulo="Nome do torneio.",
@@ -639,7 +835,8 @@ class ClanCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         modo: str,
-        participantes: str,
+        participantes: str | None = None,
+        enquete: str | None = None,
         jogadores_por_equipe: int | None = None,
         titulo: str | None = None,
     ) -> None:
@@ -668,7 +865,41 @@ class ClanCog(commands.Cog):
                 )
                 return
 
-        resolved_participants, unresolved_entries = self.resolve_tournament_members(guild, participantes)
+        manual_participants = participantes.strip() if participantes else ""
+        poll_link = enquete.strip() if enquete else ""
+        if bool(manual_participants) == bool(poll_link):
+            await interaction.response.send_message(
+                "Informe os participantes manualmente ou o link de uma enquete, mas nao os dois.",
+                ephemeral=True,
+            )
+            return
+
+        if poll_link:
+            poll_message, error_message = await self.fetch_poll_message(guild, poll_link)
+            if error_message:
+                await interaction.response.send_message(error_message, ephemeral=True)
+                return
+            if poll_message is None:
+                await interaction.response.send_message(
+                    "Nao consegui carregar essa enquete.", ephemeral=True
+                )
+                return
+            view = PollTournamentSelectionView(
+                self,
+                owner_id=interaction.user.id,
+                poll_message=poll_message,
+                mode=modo,
+                team_size=team_size,
+                title=titulo,
+            )
+            await interaction.response.send_message(
+                "Escolha qual opcao da enquete vai fornecer os participantes do torneio.",
+                view=view,
+                ephemeral=True,
+            )
+            return
+
+        resolved_participants, unresolved_entries = self.resolve_tournament_members(guild, manual_participants)
         if unresolved_entries:
             unresolved_text = ", ".join(trim_text(entry, 40) for entry in unresolved_entries[:5])
             await interaction.response.send_message(
@@ -3740,6 +3971,7 @@ class ClanBot(commands.Bot):
         intents.messages = True
         intents.message_content = True
         intents.invites = True
+        intents.polls = True
 
         super().__init__(command_prefix="!", intents=intents, max_messages=settings.max_messages)
 
