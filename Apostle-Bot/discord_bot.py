@@ -3892,7 +3892,7 @@ class ClanCog(commands.Cog):
             await interaction.response.send_message("Nao consegui identificar o membro.", ephemeral=True)
             return
 
-        tier_label, _ = self.bot.get_tournament_tier(target)
+        tier_label, _ = self.get_tournament_tier(target)
         link = self.bot.database.get_roblox_link(guild.id, target.id)
 
         embed = self.build_embed(f"Perfil de {target.display_name}", color=discord.Color.dark_teal())
@@ -3930,7 +3930,7 @@ class ClanCog(commands.Cog):
         for member in guild.members:
             if member.bot:
                 continue
-            tier_label, tier_weight = self.bot.get_tournament_tier(member)
+            tier_label, tier_weight = self.get_tournament_tier(member)
             if tier_label == "Sem grade":
                 continue
             ranked_members.append((tier_weight, tier_label, member))
