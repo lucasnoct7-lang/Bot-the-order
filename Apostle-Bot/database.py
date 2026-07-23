@@ -610,6 +610,16 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_tournament_entries_tournament
             ON tournament_entries (tournament_id, team_id);
+
+            CREATE TABLE IF NOT EXISTS roblox_links (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                roblox_id INTEGER NOT NULL,
+                roblox_username TEXT NOT NULL,
+                avatar_url TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            );
             """
         )
         self._ensure_column("guild_settings", "evaluation_channel_id", "INTEGER")
@@ -731,6 +741,51 @@ class Database:
                     }
                 )
         return list(grouped.values())
+
+    def upsert_roblox_link(
+        self,
+        guild_id: int,
+        user_id: int,
+        roblox_id: int,
+        roblox_username: str,
+        avatar_url: str | None,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO roblox_links (guild_id, user_id, roblox_id, roblox_username, avatar_url, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    roblox_id = excluded.roblox_id,
+                    roblox_username = excluded.roblox_username,
+                    avatar_url = excluded.avatar_url,
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, user_id, roblox_id, roblox_username, avatar_url, utcnow_iso()),
+            )
+
+    def get_roblox_link(self, guild_id: int, user_id: int) -> dict[str, Any] | None:
+        cursor = self.connection.execute(
+            "SELECT * FROM roblox_links WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def delete_roblox_link(self, guild_id: int, user_id: int) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM roblox_links WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+        return cursor.rowcount > 0
+
+    def list_roblox_links(self, guild_id: int) -> list[dict[str, Any]]:
+        cursor = self.connection.execute(
+            "SELECT * FROM roblox_links WHERE guild_id = ?",
+            (guild_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
     def close_tournament(self, guild_id: int, tournament_id: int) -> bool:
         with self.connection:

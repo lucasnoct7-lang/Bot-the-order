@@ -14,6 +14,7 @@ import re
 from typing import Any
 import unicodedata
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -3834,6 +3835,146 @@ class ClanCog(commands.Cog):
         embed.set_footer(text="Ordenado por grade e depois por low/mid/high.")
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="vincular_roblox", description="Vincula sua conta do Roblox para aparecer no perfil e nos rankings.")
+    @app_commands.describe(usuario_roblox="Seu nome de usuario exato no Roblox")
+    async def vincular_roblox(self, interaction: discord.Interaction, usuario_roblox: str) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Esse comando so funciona no servidor.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        roblox_user = await self.bot.fetch_roblox_user(usuario_roblox)
+        if roblox_user is None:
+            await interaction.followup.send(
+                f"Nao encontrei nenhum usuario do Roblox chamado `{usuario_roblox}`. Confira a grafia e tente novamente.",
+                ephemeral=True,
+            )
+            return
+
+        roblox_id = int(roblox_user["id"])
+        roblox_username = roblox_user.get("name", usuario_roblox)
+        avatar_url = await self.bot.fetch_roblox_avatar_url(roblox_id)
+
+        self.bot.database.upsert_roblox_link(
+            guild_id=interaction.guild.id,
+            user_id=interaction.user.id,
+            roblox_id=roblox_id,
+            roblox_username=roblox_username,
+            avatar_url=avatar_url,
+        )
+
+        embed = self.build_embed("Conta Roblox vinculada", color=discord.Color.green())
+        embed.description = f"Sua conta foi vinculada a **{roblox_username}**."
+        if avatar_url:
+            embed.set_thumbnail(url=avatar_url)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="desvincular_roblox", description="Remove o vinculo da sua conta Roblox.")
+    async def desvincular_roblox(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Esse comando so funciona no servidor.", ephemeral=True)
+            return
+        removed = self.bot.database.delete_roblox_link(interaction.guild.id, interaction.user.id)
+        if removed:
+            await interaction.response.send_message("Vinculo da conta Roblox removido.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Voce nao tinha nenhuma conta Roblox vinculada.", ephemeral=True)
+
+    @app_commands.command(name="perfil", description="Mostra seu perfil com a grade atual e o boneco do Roblox.")
+    async def perfil(self, interaction: discord.Interaction, usuario: discord.Member | None = None) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Esse comando so funciona no servidor.", ephemeral=True)
+            return
+
+        target = usuario or interaction.user
+        if not isinstance(target, discord.Member):
+            await interaction.response.send_message("Nao consegui identificar o membro.", ephemeral=True)
+            return
+
+        grade_role = self.bot.get_member_grade_role(target)
+        subtier_role = self.bot.get_member_grade_subtier_role(target)
+        link = self.bot.database.get_roblox_link(guild.id, target.id)
+
+        embed = self.build_embed(f"Perfil de {target.display_name}", color=discord.Color.dark_teal())
+        embed.set_author(name=str(target), icon_url=target.display_avatar.url)
+        embed.add_field(
+            name="Grade atual",
+            value=format_grade_result_label(
+                grade_role.mention if grade_role else None,
+                subtier_role.mention if subtier_role else None,
+            ),
+            inline=False,
+        )
+
+        if link is not None:
+            embed.add_field(name="Roblox vinculado", value=f"`{link['roblox_username']}`", inline=False)
+            avatar_url = link.get("avatar_url")
+            if avatar_url:
+                embed.set_image(url=avatar_url)
+        else:
+            is_self = target.id == interaction.user.id
+            vinculo_texto = (
+                "Nenhuma conta Roblox vinculada."
+                if is_self
+                else f"{target.mention} ainda nao vinculou uma conta Roblox."
+            )
+            embed.add_field(name="Roblox vinculado", value=vinculo_texto, inline=False)
+            if is_self:
+                embed.set_footer(text="Use /vincular_roblox para mostrar seu boneco aqui.")
+
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="top_grade", description="Mostra o top 10 de grade do servidor, com o boneco do Roblox de cada um.")
+    async def top_grade(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Esse comando so funciona no servidor.", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        ranked_members: list[tuple[int, int, discord.Member, discord.Role, discord.Role | None]] = []
+        for member in guild.members:
+            if member.bot:
+                continue
+            grade_role = self.bot.get_member_grade_role(member)
+            if grade_role is None:
+                continue
+            subtier_role = self.bot.get_member_grade_subtier_role(member)
+            grade_index = self.bot.get_grade_index(grade_role.id)
+            if grade_index is None:
+                continue
+            subtier_index = self.bot.get_grade_subtier_index(subtier_role.name if subtier_role else None)
+            ranked_members.append((grade_index, subtier_index, member, grade_role, subtier_role))
+
+        if not ranked_members:
+            await interaction.followup.send("Ninguem com grade foi encontrado no servidor.")
+            return
+
+        ranked_members.sort(key=lambda item: (-item[0], -item[1], item[2].display_name.casefold()))
+        top10 = ranked_members[:10]
+
+        await interaction.followup.send(f"**Top {len(top10)} por grade**")
+        for position, (_, _, member, grade_role, subtier_role) in enumerate(top10, start=1):
+            link = self.bot.database.get_roblox_link(guild.id, member.id)
+            embed = self.build_embed(f"#{position} - {member.display_name}", color=discord.Color.gold())
+            embed.set_author(name=str(member), icon_url=member.display_avatar.url)
+            embed.add_field(
+                name="Grade",
+                value=format_grade_result_label(
+                    grade_role.mention,
+                    subtier_role.mention if subtier_role else None,
+                ),
+                inline=False,
+            )
+            if link is not None and link.get("avatar_url"):
+                embed.set_image(url=link["avatar_url"])
+                embed.add_field(name="Roblox", value=f"`{link['roblox_username']}`", inline=False)
+            else:
+                embed.add_field(name="Roblox", value="Nao vinculado", inline=False)
+            await interaction.followup.send(embed=embed)
+
     @app_commands.command(name="temporada_competitiva", description="Mostra o ranking atual e o resumo das temporadas competitivas.")
     async def temporada_competitiva(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
@@ -3987,8 +4128,10 @@ class ClanBot(commands.Bot):
         self.pending_grade_evaluations: dict[tuple[int, int], dict[str, str]] = {}
         self.dashboard_runner: Any = None
         self.ticket_timeout_task: asyncio.Task[None] | None = None
+        self.http_session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self) -> None:
+        self.http_session = aiohttp.ClientSession()
         self.add_view(self.help_view)
         self.add_view(self.report_ticket_view)
         self.add_view(self.ticket_panel_view)
@@ -4025,6 +4168,8 @@ class ClanBot(commands.Bot):
             self.ticket_timeout_task.cancel()
         if self.dashboard_runner is not None:
             await self.dashboard_runner.cleanup()
+        if self.http_session is not None:
+            await self.http_session.close()
         self.database.close()
         await super().close()
 
@@ -4738,6 +4883,54 @@ class ClanBot(commands.Bot):
             if normalize_lookup_text(role.name) == wanted:
                 return role
         return None
+
+    async def fetch_roblox_user(self, username: str) -> dict[str, Any] | None:
+        if self.http_session is None:
+            return None
+        try:
+            async with self.http_session.post(
+                "https://users.roblox.com/v1/usernames/users",
+                json={"usernames": [username], "excludeBannedUsers": True},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return None
+
+        results = payload.get("data") or []
+        if not results:
+            return None
+        return results[0]
+
+    async def fetch_roblox_avatar_url(self, roblox_id: int) -> str | None:
+        if self.http_session is None:
+            return None
+        try:
+            async with self.http_session.get(
+                "https://thumbnails.roblox.com/v1/users/avatar",
+                params={
+                    "userIds": str(roblox_id),
+                    "size": "420x420",
+                    "format": "Png",
+                    "isCircular": "false",
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return None
+
+        results = payload.get("data") or []
+        if not results:
+            return None
+        entry = results[0]
+        if entry.get("state") != "Completed":
+            return None
+        return entry.get("imageUrl")
 
     def get_member_grade_role(self, member: discord.Member) -> discord.Role | None:
         grade_role_ids = set(self.settings.grade_role_ids)
