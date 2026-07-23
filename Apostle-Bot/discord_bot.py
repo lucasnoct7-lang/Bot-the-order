@@ -3892,20 +3892,12 @@ class ClanCog(commands.Cog):
             await interaction.response.send_message("Nao consegui identificar o membro.", ephemeral=True)
             return
 
-        grade_role = self.bot.get_member_grade_role(target)
-        subtier_role = self.bot.get_member_grade_subtier_role(target)
+        tier_label, _ = self.bot.get_tournament_tier(target)
         link = self.bot.database.get_roblox_link(guild.id, target.id)
 
         embed = self.build_embed(f"Perfil de {target.display_name}", color=discord.Color.dark_teal())
         embed.set_author(name=str(target), icon_url=target.display_avatar.url)
-        embed.add_field(
-            name="Grade atual",
-            value=format_grade_result_label(
-                grade_role.mention if grade_role else None,
-                subtier_role.mention if subtier_role else None,
-            ),
-            inline=False,
-        )
+        embed.add_field(name="Grade atual", value=tier_label, inline=False)
 
         if link is not None:
             embed.add_field(name="Roblox vinculado", value=f"`{link['roblox_username']}`", inline=False)
@@ -3934,40 +3926,28 @@ class ClanCog(commands.Cog):
 
         await interaction.response.defer(thinking=True)
 
-        ranked_members: list[tuple[int, int, discord.Member, discord.Role, discord.Role | None]] = []
+        ranked_members: list[tuple[int, str, discord.Member]] = []
         for member in guild.members:
             if member.bot:
                 continue
-            grade_role = self.bot.get_member_grade_role(member)
-            if grade_role is None:
+            tier_label, tier_weight = self.bot.get_tournament_tier(member)
+            if tier_label == "Sem grade":
                 continue
-            subtier_role = self.bot.get_member_grade_subtier_role(member)
-            grade_index = self.bot.get_grade_index(grade_role.id)
-            if grade_index is None:
-                continue
-            subtier_index = self.bot.get_grade_subtier_index(subtier_role.name if subtier_role else None)
-            ranked_members.append((grade_index, subtier_index, member, grade_role, subtier_role))
+            ranked_members.append((tier_weight, tier_label, member))
 
         if not ranked_members:
             await interaction.followup.send("Ninguem com grade foi encontrado no servidor.")
             return
 
-        ranked_members.sort(key=lambda item: (-item[0], -item[1], item[2].display_name.casefold()))
+        ranked_members.sort(key=lambda item: (-item[0], item[2].display_name.casefold()))
         top10 = ranked_members[:10]
 
         await interaction.followup.send(f"**Top {len(top10)} por grade**")
-        for position, (_, _, member, grade_role, subtier_role) in enumerate(top10, start=1):
+        for position, (_, tier_label, member) in enumerate(top10, start=1):
             link = self.bot.database.get_roblox_link(guild.id, member.id)
             embed = self.build_embed(f"#{position} - {member.display_name}", color=discord.Color.gold())
             embed.set_author(name=str(member), icon_url=member.display_avatar.url)
-            embed.add_field(
-                name="Grade",
-                value=format_grade_result_label(
-                    grade_role.mention,
-                    subtier_role.mention if subtier_role else None,
-                ),
-                inline=False,
-            )
+            embed.add_field(name="Grade", value=tier_label, inline=False)
             if link is not None and link.get("avatar_url"):
                 embed.set_image(url=link["avatar_url"])
                 embed.add_field(name="Roblox", value=f"`{link['roblox_username']}`", inline=False)
