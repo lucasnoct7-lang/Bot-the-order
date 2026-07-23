@@ -620,6 +620,16 @@ class Database:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (guild_id, user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS manual_grade_overrides (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                tier_label TEXT NOT NULL,
+                tier_weight INTEGER NOT NULL,
+                set_by_user_id INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            );
             """
         )
         self._ensure_column("guild_settings", "evaluation_channel_id", "INTEGER")
@@ -741,6 +751,51 @@ class Database:
                     }
                 )
         return list(grouped.values())
+
+    def upsert_manual_grade_override(
+        self,
+        guild_id: int,
+        user_id: int,
+        tier_label: str,
+        tier_weight: int,
+        set_by_user_id: int,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO manual_grade_overrides (guild_id, user_id, tier_label, tier_weight, set_by_user_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    tier_label = excluded.tier_label,
+                    tier_weight = excluded.tier_weight,
+                    set_by_user_id = excluded.set_by_user_id,
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, user_id, tier_label, tier_weight, set_by_user_id, utcnow_iso()),
+            )
+
+    def get_manual_grade_override(self, guild_id: int, user_id: int) -> dict[str, Any] | None:
+        cursor = self.connection.execute(
+            "SELECT * FROM manual_grade_overrides WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def delete_manual_grade_override(self, guild_id: int, user_id: int) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM manual_grade_overrides WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+        return cursor.rowcount > 0
+
+    def list_manual_grade_overrides(self, guild_id: int) -> list[dict[str, Any]]:
+        cursor = self.connection.execute(
+            "SELECT * FROM manual_grade_overrides WHERE guild_id = ?",
+            (guild_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
     def upsert_roblox_link(
         self,

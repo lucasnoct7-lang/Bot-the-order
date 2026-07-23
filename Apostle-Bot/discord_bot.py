@@ -633,6 +633,10 @@ class ClanCog(commands.Cog):
         return participants, unresolved_entries
 
     def get_tournament_tier(self, member: discord.Member) -> tuple[str, int]:
+        override = self.bot.database.get_manual_grade_override(member.guild.id, member.id)
+        if override is not None:
+            return override["tier_label"], override["tier_weight"]
+
         role_names = {normalize_lookup_text(role.name) for role in member.roles}
         for tier_label, tier_weight, aliases in TOURNAMENT_BALANCE_TIERS:
             if any(normalize_lookup_text(alias) in role_names for alias in aliases):
@@ -3916,6 +3920,86 @@ class ClanCog(commands.Cog):
                 embed.set_footer(text="Use /vincular_roblox para mostrar seu boneco aqui.")
 
         await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="definir_grade_manual", description="[Admin] Define manualmente a grade de um membro no ranking, ignorando o cargo.")
+    @app_commands.describe(usuario="Membro que vai receber a grade manual", grade="Grade a ser atribuida")
+    @app_commands.choices(
+        grade=[
+            app_commands.Choice(name=tier_label, value=tier_label)
+            for tier_label, _, _ in TOURNAMENT_BALANCE_TIERS
+        ]
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def definir_grade_manual(
+        self,
+        interaction: discord.Interaction,
+        usuario: discord.Member,
+        grade: app_commands.Choice[str],
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Esse comando so funciona no servidor.", ephemeral=True)
+            return
+
+        tier_weight = next(
+            (weight for label, weight, _ in TOURNAMENT_BALANCE_TIERS if label == grade.value),
+            0,
+        )
+        self.bot.database.upsert_manual_grade_override(
+            guild_id=interaction.guild.id,
+            user_id=usuario.id,
+            tier_label=grade.value,
+            tier_weight=tier_weight,
+            set_by_user_id=interaction.user.id,
+        )
+        embed = self.build_embed("Grade manual definida", color=discord.Color.green())
+        embed.description = (
+            f"{usuario.mention} agora esta marcado como **{grade.value}** manualmente.\n"
+            f"Isso vale para `/perfil`, `/top_grade` e para o sorteio de torneios, "
+            f"independente do cargo que a pessoa tem no servidor."
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="remover_grade_manual", description="[Admin] Remove a grade manual de um membro, voltando a usar o cargo automaticamente.")
+    @app_commands.describe(usuario="Membro que vai voltar a usar deteccao automatica por cargo")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def remover_grade_manual(self, interaction: discord.Interaction, usuario: discord.Member) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Esse comando so funciona no servidor.", ephemeral=True)
+            return
+
+        removed = self.bot.database.delete_manual_grade_override(interaction.guild.id, usuario.id)
+        if removed:
+            await interaction.response.send_message(
+                f"Grade manual de {usuario.mention} removida. A grade volta a ser detectada pelo cargo do Discord.",
+            )
+        else:
+            await interaction.response.send_message(
+                f"{usuario.mention} nao tinha nenhuma grade manual definida.",
+                ephemeral=True,
+            )
+
+    @app_commands.command(name="listar_grades_manuais", description="[Admin] Lista todos os membros com grade definida manualmente.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def listar_grades_manuais(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Esse comando so funciona no servidor.", ephemeral=True)
+            return
+
+        overrides = self.bot.database.list_manual_grade_overrides(interaction.guild.id)
+        if not overrides:
+            await interaction.response.send_message("Nenhuma grade manual definida no momento.", ephemeral=True)
+            return
+
+        overrides.sort(key=lambda row: -row["tier_weight"])
+        lines = []
+        for row in overrides:
+            member = interaction.guild.get_member(row["user_id"])
+            member_label = member.mention if member else f"`{row['user_id']}`"
+            lines.append(f"{member_label} - **{row['tier_label']}**")
+
+        embed = self.build_embed("Grades manuais ativas", color=discord.Color.orange())
+        embed.description = "\n".join(lines)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="top_grade", description="Mostra o top 10 de grade do servidor, com o boneco do Roblox de cada um.")
     async def top_grade(self, interaction: discord.Interaction) -> None:
